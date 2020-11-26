@@ -1,5 +1,7 @@
 import torch
 import numpy as np
+from backpack import backpack
+from backpack.extensions import BatchGrad
 
 _verbose = False
 
@@ -227,3 +229,187 @@ class FixedSGD(Optimizer):
                 p.add_(d_p, alpha=-group['lr'])
 
         return loss
+
+
+
+# Staleness-Corrected Momentum TDprop
+class SCMTDProp:
+
+    def __init__(self, parameters, alpha, momentum=0, dampening=True, weight_decay=0,
+                 diagonal=False, beta2=0, epsilon=1e-8, block_diagonal=0, disable_corr=False):
+        """
+        parameters: list of parameters
+        alpha: learning rate
+        momentum: momentum rate, beta (beta_1 in Adam)
+        dampening: multiply gradient accumulation by (1-dampening), or if True, dampening=beta
+        weight_decay: L2 weight decay factors
+        diagonal: if True uses the diagonal approximation correction, requires 3n parameters,
+            otherwise uses the full matrix, 2n + n**2 parameters.
+        beta2: TDprop beta_2, if =0 then this is just SCMSGD
+        epsilon: TDprop stability parameter
+        disable_corr:
+            If True and beta1>0, beta2>0, this is momentum-TDprop,
+            if True and beta1>beta2=0, this is momentum (but you will be wasting cycles computing batch gradients).
+            if True and beta2>beta1=0, this is TDprop
+        """
+        assert not (diagonal and block_diagonal > 0)
+        self.parameters = list(parameters)
+        self.device = self.parameters[0].device
+        self.alpha = alpha
+        self.beta1 = self.beta = momentum
+        self.dampening = 0 if dampening is False else (momentum if dampening is True else dampening)
+        self.weight_decay = weight_decay
+        self.diagonal = diagonal
+        self.beta2 = beta2
+        self.epsilon = epsilon
+        self.block_size = block_diagonal
+        self.mom_correct_bias = True
+        self.do_correction = not disable_corr
+
+        # Slice indices within a concatenated vector ofthe parameters
+        self.slices = [0] + list(np.cumsum([np.prod(i.shape) for i in self.parameters]))
+        self.nparams = self.slices[-1]
+
+        # Parameter list to vector
+        self.p2v = lambda x: torch.cat([
+            i.reshape(-1) if i is not None else torch.zeros_like(p).reshape(-1)
+            for i, p in zip(x, self.parameters)])
+
+        self.batch_p2v = lambda x, n: torch.cat([
+            i.reshape((n, -1)) if i is not None else torch.zeros((n,np.prod(p.shape)), device=p.device)
+            for i, p in zip(x, self.parameters)], 1)
+
+        # Vector to parameter list
+        self.v2p = lambda x: [
+            x[u:v].reshape(p.shape)
+            for u,v,p in zip(self.slices[:-1], self.slices[1:], self.parameters)]
+
+
+        # Tracking values
+        self.mu = torch.zeros(self.nparams, device=self.device)
+        self.tracking_parameters = [self.mu]
+
+        # SCMSGD
+        if self.do_correction:
+            if diagonal:
+                self.zeta = torch.zeros((self.nparams,), device=self.device)
+            elif block_diagonal > 0:
+                self.nparams_padding = ((block_diagonal - self.nparams % block_diagonal) *
+                                        (self.nparams % block_diagonal > 0))
+                self.nparams_bd = self.nparams + self.nparams_padding
+                self.nblocks = self.nparams_bd // block_diagonal
+                self.zeta = torch.zeros((self.nblocks, block_diagonal, block_diagonal), device=self.device)
+            else:
+                self.zeta = torch.zeros((self.nparams, self.nparams), device=self.device)
+
+            self.eta = torch.zeros(self.nparams, device=self.device)
+            self.tracking_parameters += [self.zeta, self.eta]
+
+        # TDProp
+        if beta2 > 0:
+            self.z_denom = torch.zeros(self.nparams, device=self.device)
+            self.tracking_parameters += [self.z_denom]
+
+        self._step = 0
+
+        if _verbose:
+            print(f"Model has {self.nparams:_} parameters")
+            print("Currently tracking",
+                  f"{sum(np.prod(i.shape) for i in self.tracking_parameters):_}",
+                  "extra parameters")
+            print("Block diagonal would require",
+                  f"sum({[np.prod(i.shape)**2 for i in self.parameters]}) =",
+                  f"{sum([np.prod(i.shape)**2 for i in self.parameters]):_}",
+                  'extra parameters')
+
+
+    def backward_and_step(self, vt, vtp, delta, gamma_k):
+        """Performs backward pass and step for n-step TD(0), does not work for TD(lambda)
+        Requires:
+         - v: V(s_t)
+         - vp: V(s_t+n)
+         - delta: the TD delta, i.e. (v - (r + gamma*vp)) for TD(0), (v - (G^5 + gamma^5*vp)) for 5s-TD
+             careful to profide (v - y) rather than (y - v)
+         - gamma_k: the multiplicative factor on vp applied in delta, e.g. gamma^5 for 5-step TD,
+             can be 0 e.g. if s_t+n is terminal
+        """
+        self.zero_grad()
+
+        with backpack(BatchGrad()):
+            torch.cat([vt, vtp], dim=0).sum().backward()
+        mbs = vt.shape[0]
+        batch_g = self.batch_p2v([i.grad_batch.data for i in self.parameters], mbs*2)
+        batch_dvt = batch_g[:mbs]
+        batch_dvtp = batch_g[mbs:] * gamma_k[:, None]
+        # derivative of delta^2
+        batch_dL = 2 * delta[:, None] * batch_dvt
+        dL = batch_dL.mean(0)
+
+        if self.weight_decay:
+            # We ignore weight decay when computing the correction
+            # This should not be problematic but further testing required
+            dL.add_(self.p2v(self.parameters).detach(), alpha=self.weight_decay)
+
+        self._step += 1
+        bias_correction1 = 1 - self.beta1 ** self._step if self.mom_correct_bias else 1
+        bias_correction2 = 1 - self.beta2 ** self._step
+
+        # \/V(s) - \/V(s')
+        gdiff = batch_dvt - batch_dvtp
+
+        if self.do_correction:
+            # last corrected momentum
+            mu_tm1 = self.mu - self.eta
+
+            # Update eta
+            if self.diagonal:
+                z = (gdiff * batch_dvt).mean(0)
+                #z = (gdiff.mean(0) * batch_dvt.mean(0))
+                self.eta.mul_(self.beta).add_(self.alpha * self.beta * (self.zeta * mu_tm1)) # eta
+            elif self.block_size > 0:
+                pad = torch.zeros((self.nparams_padding), device=self.device)
+                batch_pad = torch.zeros((mbs, self.nparams_padding), device=self.device)
+                batch_shape = mbs, self.nblocks, self.block_size
+                # batch_block_shape = mbs, self.nblocks, self.block_size, self.block_size
+                gdiff_padded = torch.cat([gdiff, batch_pad], 1).reshape(batch_shape)
+                batch_dvt_padded = torch.cat([batch_dvt, batch_pad], 1).reshape(batch_shape)
+                z = torch.einsum('ija,ijb->jab', gdiff_padded, batch_dvt_padded) / mbs
+                mu_padded = torch.cat([mu_tm1, pad], 0).reshape((self.nblocks, self.block_size))
+                zeta_T_times_mu = (torch.einsum('ikj,ik->ij', self.zeta, mu_padded)
+                                   .reshape((-1,))[:self.nparams]) # unpad
+                self.eta.mul_(self.beta).add_(self.alpha * self.beta * zeta_T_times_mu) # eta
+            else:
+                z = torch.einsum('ij,ik->jk', gdiff, batch_dvt) / mbs # sum of outer product
+                #z = torch.einsum('j,k->jk', gdiff.mean(0), batch_dvt.mean(0))
+                self.eta.mul_(self.beta).add_(self.alpha * self.beta * (self.zeta.T @ mu_tm1)) # eta
+            # Update zeta
+            self.zeta.mul_(self.beta).add_(z, alpha=1-self.dampening)
+
+        # Update momentum mu
+        self.mu.mul_(self.beta).add_(dL, alpha=1-self.dampening)
+        # Compute (corrected) momentum \mu_t
+        mu_t = self.mu - self.eta if self.do_correction else self.mu
+
+        # TDProp update
+        if self.beta2 > 0:
+            # diag[(\/V(s) - \/V(s')) ^T \/V(s)]
+            diag_H = (2 * gdiff * batch_dvt).pow(2).mean(0)
+            # Update TDprop denominator
+            self.z_denom.mul_(self.beta2).add_(1 - self.beta2, diag_H)
+            # Compute bias corrected TDprop denom
+            denom = (self.z_denom.sqrt() / np.sqrt(bias_correction2)).add_(self.epsilon)
+            # Update parameters
+            for p, g, d in zip(self.parameters, self.v2p(mu_t), self.v2p(denom)):
+                p.data.addcdiv_(g, d, value=-(self.alpha / bias_correction1))
+        # Normal or corrected momentum update
+        else:
+            for p, g in zip(self.parameters, self.v2p(mu_t)):
+                p.data.add_(g, alpha=-(self.alpha / bias_correction1))
+
+
+
+
+    def zero_grad(self):
+        for i in self.parameters:
+            if i.grad is not None:
+                i.grad.fill_(0)

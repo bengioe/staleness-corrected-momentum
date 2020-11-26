@@ -11,9 +11,10 @@ import copy
 import time
 
 import numpy as np
+from backpack import extend
 
 from replay_buffer import ReplayBufferV2, set_device
-from scmsgd import SCMSGD, FixedSGD, OptChain
+from scmsgd import SCMSGD, FixedSGD, OptChain, SCMTDProp
 from classical_envs import MountainCarEnv, AcrobotEnv, CartpoleEnv, LunarLanderEnv
 from rbf import RBFGrid
 
@@ -103,6 +104,8 @@ def main(path, hps):
     buffer_size = hps.get('buffer_size', 10000)
     td_n_step = hps.get('td_n_step', 1)
     corr_layers = hps.get('corr_layers', None)
+    block_size = hps.get('block_size', 0)
+    disable_corr = hps.get('disable_corr', False)
 
     if td_n_step > 1 and not gen_buffer:
       raise NotImplementedError('td_n_step > 1 and not gen_buffer')
@@ -137,6 +140,7 @@ def main(path, hps):
                               nn.Linear(n_rbf_grid**nin, 1))
         model.to(dev)
 
+    model = extend(model)
 
     paramslices = [0] + list(np.cumsum([np.prod(i.shape) for i in model.parameters()]))
     p2v = lambda x: torch.cat([i.reshape(-1) if i is not None else torch.zeros_like(p).reshape(-1)
@@ -164,12 +168,20 @@ def main(path, hps):
             replay_buffer.add(s, a, r, t)
             s = env.reset() if t else sp
 
-    if 'corr' in mode:
+    if 'corr' in mode or 'tdprop' in mode:
       if corr_layers is None:
-        opt_corr = SCMSGD(model.parameters(), learning_rate, momentum=beta,
+        if 1:
+          opt_corr = SCMTDProp(model.parameters(), learning_rate, momentum=beta,
+                               diagonal='diag' in mode, dampening=dampening,
+                               beta2=beta2, block_diagonal=block_size,
+                               disable_corr=disable_corr)
+          opt_corr.mom_correct_bias = False
+        else:
+          opt_corr = SCMSGD(model.parameters(), learning_rate, momentum=beta,
                             diagonal='diag' in mode, dampening=dampening,
                             beta2=beta2)
       else:
+        raise ValueError('fixme')
         params = list(model.parameters())
         layers = [params[i*2:i*2+2] for i in range(len(params)//2)]
         to_corr = sum([layers[i] for i in corr_layers], [])
@@ -210,9 +222,17 @@ def main(path, hps):
             mb = replay_buffer.sample(mbsize, n_step=td_n_step)
             st, stp, r, done = mb.s, mb.sp, mb.r, mb.t
 
-        vt = model(st).squeeze(1)
-        vtp = model(stp).squeeze(1) if not frozen_target else target_model(stp).squeeze(1)
-        target = (r + (gamma**td_n_step) * vtp * (1-done))
+        #vt = model(st).squeeze(1)
+        #vtp = model(stp).squeeze(1) if not frozen_target else target_model(stp).squeeze(1)
+        if not frozen_target:
+          o = model(torch.cat([st, stp], 0)).squeeze(1)
+          vt = o[:mbsize]
+          vtp = o[mbsize:]
+        else:
+          vt = model(st).squeeze(1)
+          vtp = target_model(stp).squeeze(1)
+        gamma_mask = (gamma**td_n_step) * (1-done)
+        target = (r + vtp * gamma_mask)
         loss = (vt - target.detach()).pow(2)
 
         with torch.no_grad():
@@ -257,12 +277,15 @@ def main(path, hps):
             for p in model.parameters():
                 p.data -= p.grad * learning_rate
                 p.grad.fill_(0)
-        if 'corr' in mode:
+        if 'corr' in mode or 'tdprop' in mode:
+          if 0:
             opt_corr.set_predictions(vt.mean(),
                                      None if 'novp' in mode else target.mean())
             loss.mean().backward(retain_graph=True)
             opt_corr.step()
             opt_corr.zero_grad()
+          else:
+            opt_corr.backward_and_step(vt, vtp, vt - target, gamma_mask)
         past_data = past_data[-horizon+1:] + trans
 
         if measure_drift:
@@ -348,8 +371,83 @@ if __name__ == '__main__':
                    for nhid in [16]
                    for beta in [0.99]
                    for mbsize in [1,4,16,64]
-                   for lr in [5e-3, 1e-2]
+                   for lr in [5e-3, 1e-2, 1e-1]
                    for mode in ['corr', 'corr_diag', 'normal', 'oracle']]
+
+        path = 'results/td_pe_mcar_mbsize_vs_loss_2'
+        all_hps = [{'nhid': nhid,
+                    'beta': beta,
+                    'mbsize': mbsize,
+                    'mode': mode,
+                    'num_steps': 5_000,
+                    'lr': lr,
+                    'seed': seed}
+                   for seed in range(5)
+                   for nhid in [16]
+                   for beta in [0.99]
+                   for mbsize in [1,4,16,64]
+                   for lr in [1e-1]
+                   for mode in ['corr', 'corr_diag', 'normal', 'oracle']]
+
+        path = 'results/td_pe_mcar_mbsize_vs_loss_3'
+        all_hps = [{'nhid': nhid,
+                    'beta': beta,
+                    'mbsize': mbsize,
+                    'mode': mode,
+                    'num_steps': 5_000,
+                    'lr': lr,
+                    'seed': seed}
+                   for seed in range(5)
+                   for nhid in [16]
+                   for beta in [0.99]
+                   for mbsize in [1,4,16,64]
+                   for lr in [1e-1]
+                   for mode in ['corr2', 'corr2_diag']]
+
+        path = 'results/td_pe_mcar_mbsize_vs_loss_4'
+        all_hps = [{'nhid': nhid,
+                    'beta': beta,
+                    'mbsize': mbsize,
+                    'mode': mode,
+                    'num_steps': 5_000,
+                    'lr': lr,
+                    'seed': seed}
+                   for seed in range(5)
+                   for nhid in [16]
+                   for beta in [0.99]
+                   for mbsize in [1,4,16,64]
+                   for lr in [1e-1]
+                   for mode in ['corr3', 'corr3_diag']]
+
+        path = 'results/td_pe_mcar_mbsize_vs_loss_5'
+        all_hps = [{'nhid': nhid,
+                    'beta': beta,
+                    'mbsize': mbsize,
+                    'mode': mode,
+                    'num_steps': 5_000,
+                    'lr': lr,
+                    'seed': seed}
+                   for seed in range(5)
+                   for nhid in [16]
+                   for beta in [0.99]
+                   for mbsize in [1,4,16,64]
+                   for lr in [1e-1]
+                   for mode in ['corr_fix', 'corr_fix_diag']]
+
+        path = 'results/td_pe_mcar_mbsize_vs_loss_6'
+        all_hps = [{'nhid': nhid,
+                    'beta': beta,
+                    'mbsize': mbsize,
+                    'mode': mode,
+                    'num_steps': 5_000,
+                    'lr': lr,
+                    'seed': seed}
+                   for seed in range(5)
+                   for nhid in [16]
+                   for beta in [0.99]
+                   for mbsize in [1,4,16,64]
+                   for lr in [1e-1]
+                   for mode in ['corr_true', 'corr_true_diag']]
 
     # Beta vs loss
     if 0:
@@ -413,29 +511,164 @@ if __name__ == '__main__':
            for mode in ['normal', 'oracle', 'corr', 'corr_diag']
            for mbsize in [8, 16, 32]]
 
+
+    # Frozen Target
+    if 0:
+      path = 'results/td_pe_mcar_replay_frozen'
+      all_hps = [{'nhid': nhid,
+                  'beta': beta,
+                  'mbsize': mbsize,
+                  'num_steps': 5_000,
+                  'frozen_target': True,
+                  'frozen_target_update_freq': 100,
+                  'mode': mode,
+                  'lr': lr,
+                  'seed': seed}
+                 for seed in range(10)
+                 for nhid in [16, 32]
+                 for beta in [0.9, 0.99]
+                 for lr in [0.5, 0.1, 0.05]
+                 for mode in ['normal']
+                 for mbsize in [4,16,64]]
+
+    # Figure 3 long
+    if 0:
+      path = 'results/td_pe_mcar_replay_longer'
+      all_hps = [{'nhid': nhid,
+                  'beta': beta,
+                  'mbsize': mbsize,
+                  'num_steps': 50_000,
+                  'mode': mode,
+                  'lr': lr,
+                  'seed': seed}
+                 for seed in range(10)
+                 for nhid in [32]
+                 for beta in [0.9]
+                 for lr in [0.5, 0.1, 0.05]
+                 for mode in ['normal', 'oracle', 'corr', 'corr_diag']
+                 for mbsize in [16]]
+    # Figure 3 more lr
+    if 0:
+      path = 'results/td_pe_mcar_replay_stepsize'
+      all_hps = [{'nhid': nhid,
+                  'beta': beta,
+                  'mbsize': mbsize,
+                  'num_steps': 5_000,
+                  'mode': mode,
+                  'lr': lr,
+                  'seed': seed}
+                 for seed in range(10)
+                 for nhid in [32]
+                 for beta in [0.9]
+                 for lr in [0.5, 0.4, 0.3, 0.2, 0.1, 0.075, 0.05, 0.025, 0.01, 0.005, 0.001]
+                 for mode in ['normal', 'oracle', 'corr', 'corr_diag']
+                 for mbsize in [4]]
+
+    if 0:
+      path = 'results/td_pe_mcar_replay_tdprop_2'
+      all_hps = [{'nhid': nhid,
+                  'beta': beta if 'corr' in mode else 0,
+                  'beta2': 0.999 if 'tdprop' in mode else 0,
+                  'mbsize': mbsize,
+                  'num_steps': 5_000,
+                  'mode': mode,
+                  'lr': lr,
+                  'seed': seed}
+                 for seed in range(5)
+                 for nhid in [32]
+                 for beta in [0.9]
+                 for mode in ['corr_tdprop_diag', 'corr', 'corr_diag', 'tdprop', 'corr_tdprop']
+                 for lr in (np.logspace(-4, -2.5, 10) if 'tdprop' in mode else
+                            np.logspace(-2.5, -0.5, 10))
+                 for mbsize in [16]]
+
+    if 1:
+      path = 'results/td_pe_mcar_replay_blockd'
+      all_hps = [{'nhid': nhid,
+                  'beta': beta if 'corr' in mode else 0,
+                  'beta2': 0.999 if 'tdprop' in mode else 0,
+                  'mbsize': mbsize,
+                  'num_steps': 5_000,
+                  'block_size': block_size,
+                  'mode': mode,
+                  'lr': lr,
+                  'seed': seed}
+                 for seed in range(5)
+                 for nhid in [32]
+                 for beta in [0.9]
+                 for block_size in [2,4,8,16,32]
+                 for mode in ['corr_tdprop_blockd', 'corr_blockd']
+                 for lr in ([1.5e-3] if 'tdprop' in mode else
+                            [2e-1])
+                 for mbsize in [16]]
+
+      path = 'results/td_pe_mcar_replay_blockd_2'
+      all_hps = [{'nhid': nhid,
+                  'beta': beta if 'corr' in mode else 0,
+                  'beta2': 0.999 if 'tdprop' in mode else 0,
+                  'mbsize': mbsize,
+                  'num_steps': 5_000,
+                  'block_size': block_size,
+                  'mode': mode,
+                  'lr': lr,
+                  'seed': seed}
+                 for seed in range(5)
+                 for nhid in [32]
+                 for beta in [0.9]
+                 for block_size in [0]
+                 for mode in ['corr_tdprop_diag', 'corr_diag', 'corr', 'corr_tdprop']
+                 for lr in ([1.5e-3] if 'tdprop' in mode else
+                            [2e-1])
+                 for mbsize in [16]]
+
+      path = 'results/td_pe_mcar_replay_blockd_3'
+      all_hps = [{'nhid': nhid,
+                  'beta': beta if 'mom' in mode else 0,
+                  'beta2': 0.999 if 'tdprop' in mode else 0,
+                  'disable_corr': True,
+                  'mbsize': mbsize,
+                  'num_steps': 5_000,
+                  'mode': mode,
+                  'lr': lr,
+                  'seed': seed}
+                 for seed in range(5)
+                 for nhid in [32]
+                 for beta in [0.9]
+                 for block_size in [0]
+                 for mode in ['tdprop', 'tdprop_mom']
+                 for lr in ([1.5e-3, 2e-4, 1e-4, 1e-3, 5e-3])
+                 for mbsize in [16]]
+
+
+
     for i, u in enumerate(all_hps):
-        u['id'] = i + base
+        u['id'] = i
     print(len(all_hps), 'experiments')
 
-    torch.set_num_threads(1)
-    import ray
-    ray.init(num_cpus=6)
 
-    conn = lmdb.open(path, map_size=int(16 * 2 ** 30)) # 16gb max?
-    with conn.begin(write=True) as txn:
-        txn.put(b'comment', comment.encode())
+    if 0:
+        _progress = True
+        import importlib
+        import scmsgd
+        importlib.reload(scmsgd)
+        from scmsgd import SCMSGD, FixedSGD, OptChain, SCMTDProp
+        main(path, all_hps[0])
+    else:
+        torch.set_num_threads(1)
+        import ray
+        ray.init(num_cpus=8)
 
-    rmain = ray.remote(main)
-    with conn.begin() as txn:
-        cursor = txn.cursor()
-        jobs = [rmain.remote(path, i) for i in all_hps
-                if (not cursor.set_key(str(i['id']).encode() + b'_hps'))]
+        conn = lmdb.open(path, map_size=int(16 * 2 ** 30)) # 16gb max?
 
-    print(len(jobs), 'jobs')
+        rmain = ray.remote(main)
+        with conn.begin() as txn:
+            cursor = txn.cursor()
+            jobs = [rmain.remote(path, i) for i in all_hps
+                    if (not cursor.set_key(str(i['id']).encode() + b'_hps'))]
+        print(len(jobs), 'jobs')
 
-
-    with tqdm.tqdm(total=len(jobs), smoothing=0) as t:
-        while len(jobs):
-            ready, jobs = ray.wait(jobs)
-            for i in ready:
-                t.update()
+        with tqdm.tqdm(total=len(jobs), smoothing=0) as t:
+            while len(jobs):
+                ready, jobs = ray.wait(jobs)
+                for i in ready:
+                    t.update()

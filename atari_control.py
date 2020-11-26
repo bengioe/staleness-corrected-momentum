@@ -19,7 +19,7 @@ from replay_buffer import ReplayBufferV2
 from atari_env import AtariEnv
 from rainbow import DQN
 
-from scmsgd import SCMSGD, OptChain
+from scmsgd import SCMSGD, OptChain, SCMTDProp
 
 
 parser = argparse.ArgumentParser()
@@ -40,6 +40,7 @@ parser.add_argument("--opt", default='adam')
 parser.add_argument("--opt_momentum", default=0.9, type=float)
 parser.add_argument("--opt_beta2", default=0.999, type=float)
 parser.add_argument("--opt_diagonal", default=True, type=int)
+parser.add_argument("--opt_block_diagonal", default=0, type=int)
 parser.add_argument("--opt_ignore_vprime", default=0, type=int)
 parser.add_argument("--opt_correct_adam", default=0, type=int)
 parser.add_argument("--num_full_corr", default=0, type=int,
@@ -102,12 +103,13 @@ def make_opt(args, theta):
         # head_type == 'slim', which adds a slimmer head with fewer
         # parameters to maintain an O(n^2) matrix of.
         return OptChain([
-          SCMSGD(sub_theta, args.learning_rate, weight_decay=args.weight_decay,
-                   momentum=args.opt_momentum,
-                   dampening=args.opt_momentum,
-                   diagonal=diag,
-                   correct_adam=args.opt_correct_adam,
-                   beta2=args.opt_beta2)
+          SCMTDProp(sub_theta, args.learning_rate, weight_decay=args.weight_decay,
+                    momentum=args.opt_momentum,
+                    dampening=args.opt_momentum,
+                    diagonal=diag,
+                    block_diagonal=args.block_diagonal,
+                    #correct_adam=args.opt_correct_adam,
+                    beta2=args.opt_beta2)
           for sub_theta, diag in ([(theta[:-args.num_full_corr], args.opt_diagonal),
                                    (theta[-args.num_full_corr:], False)] # Force non-diagonal
                                   if args.num_full_corr > 0 else
@@ -254,7 +256,7 @@ def main(args):
 
   opt = make_opt(args, Qf.parameters())
   opt.epsilon = 1e-2
-  do_set_predictions = args.opt == 'msgd_corr'
+  do_specific_backward = args.opt == 'msgd_corr'
 
   # Replay Buffer
   replay_buffer = ReplayBufferV2(seed, args.buffer_size)
@@ -317,18 +319,26 @@ def main(args):
 
     sample = replay_buffer.sample(mbsize, n_step=td_steps)
 
-    q = Qf(sample.s)
-    v = q[ar(q), sample.a.long()]
-    vp = Qf_target(sample.sp)[ar(q), sample.ap.long()]
-    gvp = (1 - sample.t.float()) * (gamma ** td_steps) * vp
-    loss = (v - (sample.r + gvp.detach())).pow(2)
-    if do_set_predictions:
-      opt.set_predictions(v.mean(), gvp.mean() if not ignore_vprime else None)
+    if Qf_target is Qf:
+      q = Qf(torch.cat([sample.s, sample.sp], 0))
+      v = q[ar(sample.s), sample.a.long()]
+      vp = q[ar(sample.sp)+sample.s.shape[0], sample.ap.long()]
+    else:
+      q = Qf(sample.s)
+      v = q[ar(q), sample.a.long()]
+      vp = Qf_target(sample.sp)[ar(q), sample.ap.long()]
 
-    loss = loss.mean()
-    loss.backward(retain_graph=True)
-    opt.step()
-    opt.zero_grad()
+    gamma_mask = (1 - sample.t.float()) * (gamma ** td_steps)
+    target = sample.r + gamma_mask * vp
+    loss = (v - target.detach()).pow(2)
+    if do_specific_backward:
+      opt.backward_and_step(v, vp, v - target, gamma_mask)
+      #opt.set_predictions(v.mean(), gvp.mean() if not ignore_vprime else None)
+    else:
+      loss = loss.mean()
+      loss.backward()
+      opt.step()
+      opt.zero_grad()
 
     losses.append(loss.item())
 
